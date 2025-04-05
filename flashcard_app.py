@@ -2,25 +2,63 @@
 
 # Written by Ovi
 # Date: 2025-04-04
-# Summary: A feature-rich Streamlit Bangla flashcard app with login, multiple sets, hint system, pronunciation, gamification, and proper session control.
+# Summary: Streamlit-based flashcard app with login, logout, multiple sets, pronunciation, hints, gamified stats, and persistent user tracking with resume support.
 
 import streamlit as st
 import pandas as pd
 import random
 import os
 import datetime
-import streamlit.components.v1 as components
 import hashlib
+import streamlit.components.v1 as components
 
 # --------------------- CONFIG ---------------------
 st.set_page_config(page_title="Bangla Flashcards", layout="centered")
 
-# --------------------- SIMPLE AUTH ---------------------
+# --------------------- USER SYSTEM ---------------------
 users = {
     "ovi": hashlib.sha256("1234".encode()).hexdigest(),
     "guest": hashlib.sha256("guest".encode()).hexdigest()
 }
 
+def ensure_user_data_dir():
+    os.makedirs("user_data", exist_ok=True)
+
+def get_user_file(username):
+    return f"user_data/{username}_history.csv"
+
+def load_user_data(username):
+    ensure_user_data_dir()
+    file = get_user_file(username)
+    if os.path.exists(file):
+        return pd.read_csv(file).set_index("word").to_dict("index")
+    return {}
+
+def save_user_data(username, history):
+    ensure_user_data_dir()
+    file = get_user_file(username)
+
+    if not history:
+        return  # Don't save if there's no history
+
+    df = pd.DataFrame.from_dict(history, orient="index")
+    df.index.name = "word"
+    df = df.reset_index()
+
+    for col in ["correct", "mistake", "last_review"]:
+        if col not in df.columns:
+            df[col] = None
+
+    df = df[["word", "correct", "mistake", "last_review"]]
+    df.to_csv(file, index=False)
+
+def logout():
+    save_user_data(st.session_state["user"], st.session_state.history)
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.rerun()
+
+# --------------------- LOGIN ---------------------
 def login():
     st.sidebar.header("🔐 Login")
     username = st.sidebar.text_input("Username")
@@ -35,44 +73,58 @@ def login():
 
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
+
 if not st.session_state["authenticated"]:
     login()
     st.stop()
 
+# --------------------- LOGGED IN STATE ---------------------
+username = st.session_state["user"]
+st.sidebar.success(f"👋 Logged in as `{username}`")
+if st.sidebar.button("🚪 Logout"):
+    logout()
+
 # --------------------- FILE SELECTION ---------------------
 st.title("📘 Bangla Vocabulary Flashcards")
 
+os.makedirs("flashcards", exist_ok=True)
 flashcard_files = [f for f in os.listdir("flashcards") if f.endswith(".xlsx")]
-selected_file = st.selectbox("📂 Choose a flashcard set", flashcard_files)
+if not flashcard_files:
+    st.warning("No flashcards found in 'flashcards/' directory.")
+    st.stop()
 
+selected_file = st.selectbox("📂 Choose a flashcard set", flashcard_files)
 df = pd.read_excel(f"flashcards/{selected_file}")
 required_columns = {'target_word', 'translation'}
 if not required_columns.issubset(df.columns):
-    st.error("❌ Required columns missing: 'target_word', 'translation'")
+    st.error("❌ Missing required columns: 'target_word', 'translation'")
     st.stop()
 
 df = df.dropna(subset=['target_word', 'translation']).reset_index(drop=True)
 
-# --------------------- SESSION STATE INIT ---------------------
+# --------------------- SESSION INIT ---------------------
 defaults = {
     "review_index": 0, "correct": 0, "mistake": 0,
-    "score": 0, "streak": 0, "order": []
+    "score": 0, "streak": 0, "order": [], "df": df
 }
 for key, val in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
-if "df" not in st.session_state or st.session_state.df is None:
-    st.session_state.df = df
-
+# Load saved history
 if "history" not in st.session_state:
-    st.session_state.history = {
-        word: {
-            "correct": 0,
-            "mistake": 0,
-            "last_review": None
-        } for word in df['target_word']
-    }
+    st.session_state.history = load_user_data(username)
+    history = st.session_state.history
+    st.session_state.correct = sum(v["correct"] for v in history.values())
+    st.session_state.mistake = sum(v["mistake"] for v in history.values())
+    st.session_state.score = st.session_state.correct * 10 - st.session_state.mistake * 5
+    st.session_state.streak = 0
+
+    reviewed_words = set(history.keys())
+    remaining = [i for i, row in df.iterrows() if row['target_word'] not in reviewed_words]
+    all_indices = remaining if remaining else list(range(len(df)))
+    st.session_state.order = random.sample(all_indices, len(all_indices))
+    st.session_state.review_index = 0
 
 # --------------------- RESET REVIEW ---------------------
 def reset_session():
@@ -83,13 +135,7 @@ def reset_session():
     st.session_state.streak = 0
     st.session_state.order = random.sample(range(len(df)), len(df))
     st.session_state.df = df
-    st.session_state.history = {
-        word: {
-            "correct": 0,
-            "mistake": 0,
-            "last_review": None
-        } for word in df['target_word']
-    }
+    st.session_state.history = {}
 
 if st.sidebar.button("🔁 Start New Review"):
     reset_session()
@@ -136,7 +182,7 @@ components.html(f"""
     </script>
 """, height=50)
 
-# --------------------- HINT TOGGLE (resets each word) ---------------------
+# --------------------- HINT TOGGLE ---------------------
 show_hint = st.checkbox("💡 Show Hint", key=f"hint_{st.session_state.review_index}")
 if show_hint:
     if pd.notna(row.get("part_of_speech")):
@@ -150,11 +196,11 @@ if show_hint:
     if pd.notna(row.get("sample_sentence")):
         st.markdown(f"✒️ Sample: _{row['sample_sentence']}_")
 
-# --------------------- TRANSLATION TOGGLE (resets each word) ---------------------
+# --------------------- TRANSLATION TOGGLE ---------------------
 show_translation = st.checkbox("👁 Show Translation", key=f"trans_{st.session_state.review_index}")
 if show_translation:
     st.markdown(f"💬 **Translation:** {row['translation']}")
-    if pd.notna(row.get('bangla_meaning')):
+    if pd.notna(row.get("bangla_meaning")):
         st.markdown(f"📝 **Bangla Meaning:** _{row['bangla_meaning']}_")
 
     col1, col2 = st.columns(2)
@@ -163,6 +209,9 @@ if show_translation:
             st.session_state.correct += 1
             st.session_state.streak += 1
             st.session_state.score += 10
+            st.session_state.history[word] = st.session_state.history.get(word, {
+                "correct": 0, "mistake": 0, "last_review": None
+            })
             st.session_state.history[word]["correct"] += 1
             st.session_state.history[word]["last_review"] = str(datetime.date.today())
             st.session_state.review_index += 1
@@ -172,6 +221,9 @@ if show_translation:
             st.session_state.mistake += 1
             st.session_state.streak = 0
             st.session_state.score = max(0, st.session_state.score - 5)
+            st.session_state.history[word] = st.session_state.history.get(word, {
+                "correct": 0, "mistake": 0, "last_review": None
+            })
             st.session_state.history[word]["mistake"] += 1
             st.session_state.history[word]["last_review"] = str(datetime.date.today())
             st.session_state.review_index += 1
